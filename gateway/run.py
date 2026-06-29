@@ -1923,6 +1923,7 @@ from gateway.restart import (
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
     parse_restart_drain_timeout,
 )
+from gateway.council import handle_council_event, prepare_council_handoff
 
 
 from gateway.whatsapp_identity import (
@@ -5508,6 +5509,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._enqueue_fifo(session_key, event, adapter)
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        # Optional bounded bot-council mode must also run on the busy path.
+        # Bot handoff replies usually arrive while the moderator agent is still
+        # active; without this pre-auth hook they get dropped as unauthorized
+        # before _handle_message() can mark the handoff role_authorized.
+        if not getattr(event, "internal", False) and not getattr(event, "_council_processed", False):
+            try:
+                source = event.source
+                adapter = self.adapters.get(source.platform)
+                bot_obj = getattr(adapter, "_bot", None) or getattr(adapter, "bot", None)
+                own_bot_id = str(getattr(bot_obj, "id", "") or "") or None
+                council_decision = handle_council_event(self.config, event, own_bot_id)
+                if council_decision.action == "skip":
+                    return True
+                if council_decision.action == "respond":
+                    if adapter:
+                        await adapter.send(source.chat_id, council_decision.response or "")
+                    return True
+                if council_decision.event is not None:
+                    event = council_decision.event
+                    setattr(event, "_council_processed", True)
+            except Exception as exc:
+                logger.warning(
+                    "Council mode busy-path hook failed; continuing normal busy dispatch: %s",
+                    exc,
+                    exc_info=True,
+                )
+
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
         # creating a session.  The busy path must enforce the same check;
@@ -9232,6 +9260,84 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    async def _run_council_handoff(self, handoff: Dict[str, str]) -> None:
+        """Run the next council participant via its profile and publish it."""
+        profile = handoff.get("profile") or ""
+        target = handoff.get("target") or ""
+        prompt = handoff.get("prompt") or ""
+        if not profile or not target or not prompt:
+            return
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-m",
+                "hermes_cli.main",
+                "--profile",
+                profile,
+                "-z",
+                prompt,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
+            if proc.returncode != 0:
+                logger.warning(
+                    "Council handoff profile %s failed rc=%s stderr=%s",
+                    profile,
+                    proc.returncode,
+                    stderr.decode(errors="replace")[-500:],
+                )
+                return
+            reply = stdout.decode(errors="replace").strip()
+            if not reply:
+                logger.warning("Council handoff profile %s returned empty response", profile)
+                return
+            send_proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-m",
+                "hermes_cli.main",
+                "--profile",
+                profile,
+                "send",
+                "--to",
+                target,
+                "--file",
+                "-",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _send_out, send_err = await asyncio.wait_for(
+                send_proc.communicate(reply.encode()),
+                timeout=60,
+            )
+            if send_proc.returncode != 0:
+                logger.warning(
+                    "Council handoff send failed profile=%s target=%s rc=%s stderr=%s",
+                    profile,
+                    target,
+                    send_proc.returncode,
+                    send_err.decode(errors="replace")[-500:],
+                )
+                return
+            logger.info("Council handoff sent via profile=%s target=%s", profile, target)
+        except Exception as exc:
+            logger.warning("Council handoff task failed: %s", exc, exc_info=True)
+
+    def _schedule_council_handoff(self, event: MessageEvent, response: str) -> None:
+        if getattr(event, "internal", False):
+            return
+        try:
+            source = event.source
+            adapter = self.adapters.get(source.platform)
+            bot_obj = getattr(adapter, "_bot", None) or getattr(adapter, "bot", None)
+            own_bot_id = str(getattr(bot_obj, "id", "") or "") or None
+            handoff = prepare_council_handoff(self.config, event, own_bot_id, response)
+            if handoff:
+                asyncio.create_task(self._run_council_handoff(handoff))
+        except Exception as exc:
+            logger.warning("Council handoff scheduling failed: %s", exc, exc_info=True)
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -9263,6 +9369,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reset_session_vars()
         except Exception:
             logger.debug("reset_session_vars failed at handler entry", exc_info=True)
+
+        # Optional bounded bot-to-bot council mode. This runs before normal
+        # auth so it can consume human stop commands immediately and narrowly
+        # authorize bot-authored handoff messages only while a human-started
+        # council session is active. Outside that mode, bot messages remain
+        # blocked by the normal allowlist/authz path.
+        if not getattr(event, "internal", False) and not getattr(event, "_council_processed", False):
+            try:
+                adapter = self.adapters.get(source.platform)
+                bot_obj = getattr(adapter, "_bot", None) or getattr(adapter, "bot", None)
+                own_bot_id = str(getattr(bot_obj, "id", "") or "") or None
+                council_decision = handle_council_event(self.config, event, own_bot_id)
+                if council_decision.action == "skip":
+                    return None
+                if council_decision.action == "respond":
+                    return council_decision.response or ""
+                if council_decision.event is not None:
+                    event = council_decision.event
+                    setattr(event, "_council_processed", True)
+                    source = event.source
+            except Exception as exc:
+                logger.warning(
+                    "Council mode hook failed; continuing normal dispatch: %s",
+                    exc,
+                    exc_info=True,
+                )
 
         if (
             getattr(self, "_startup_restore_in_progress", False)
@@ -12706,6 +12838,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.debug("trailing footer send failed: %s", _e)
                 return None
 
+            self._schedule_council_handoff(event, response)
             return response
             
         except Exception as e:

@@ -8970,8 +8970,8 @@ class TelegramAdapter(BasePlatformAdapter):
             ),
             thread_id=thread_id_str,
             chat_topic=chat_topic,
-            message_id=str(message.message_id),
             is_bot=bool(getattr(user, "is_bot", False)) if user else False,
+            message_id=str(message.message_id),
         )
         
         # Extract reply context if this message is a reply.
